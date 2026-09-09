@@ -11,11 +11,11 @@ use super::{
 use crate::{
     bin::BinaryReader,
     config::{Config, Mods},
-    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector, PGR_FONT},
+    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, NoteKind, Point, Resource, UIElement, Vector, PGR_FONT},
     ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture, ScaleType},
     fs::FileSystem,
     info::{ChartFormat, ChartInfo},
-    judge::Judge,
+    judge::{Judge, Judgement},
     parse::{parse_extra, parse_pec, parse_phigros, parse_rpe},
     task::Task,
     time::TimeManager,
@@ -116,6 +116,34 @@ enum State {
     Ending,
 }
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+#[derive(Serialize)]
+struct TouchRecord {
+    t: f64,
+    phase: &'static str,
+    id: u64,
+    x: f32,
+    y: f32,
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+#[derive(Serialize)]
+struct NoteRecord {
+    t: f64,
+    line: u32,
+    note: u32,
+    kind: &'static str,
+    judgement: &'static str,
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+#[derive(Serialize)]
+struct EventLog {
+    offset: f32,
+    touches: Vec<TouchRecord>,
+    notes: Vec<NoteRecord>,
+}
+
 pub struct GameScene {
     should_exit: bool,
     next_scene: Option<NextScene>,
@@ -148,6 +176,10 @@ pub struct GameScene {
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     recording: Option<recorder::Recording>,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    touches_log: Vec<TouchRecord>,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    events_exported: bool,
 
     upload_fn: Option<UploadFn>,
     update_fn: Option<UpdateFn>,
@@ -344,6 +376,10 @@ impl GameScene {
 
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
             recording: None,
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            touches_log: Vec::new(),
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            events_exported: false,
 
             upload_fn,
             update_fn,
@@ -886,7 +922,102 @@ impl GameScene {
     }
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn export_events(&mut self) {
+        if self.events_exported {
+            return;
+        }
+        self.events_exported = true;
+
+        let offset = self.offset() as f64;
+        let notes = self.judge.judgements.borrow();
+        if self.touches_log.is_empty() && notes.is_empty() {
+            return;
+        }
+        let note_records: Vec<NoteRecord> = notes
+            .iter()
+            .filter_map(|(t, line_id, note_id, res)| {
+                let kind = self
+                    .chart
+                    .lines
+                    .get(*line_id as usize)
+                    .and_then(|line| line.notes.get(*note_id as usize))
+                    .map(|note| match &note.kind {
+                        NoteKind::Click => "click",
+                        NoteKind::Hold { .. } => "hold",
+                        NoteKind::Flick => "flick",
+                        NoteKind::Drag => "drag",
+                    })
+                    .unwrap_or("unknown");
+                let judgement = match *res {
+                    Ok(Judgement::Perfect) => "perfect",
+                    Ok(Judgement::Good) => "good",
+                    Ok(Judgement::Bad) => "bad",
+                    Ok(Judgement::Miss) => "miss",
+                    Err(true) => "hold_perfect",
+                    Err(false) => "hold_good",
+                };
+                Some(NoteRecord {
+                    t: t + offset,
+                    line: *line_id,
+                    note: *note_id,
+                    kind,
+                    judgement,
+                })
+            })
+            .collect();
+        let log = EventLog {
+            offset: self.offset(),
+            touches: std::mem::take(&mut self.touches_log),
+            notes: note_records,
+        };
+        let dir = self.recording_dir();
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            warn!("failed to create recording dir: {err:?}");
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|it| it.as_millis())
+            .unwrap_or_default();
+        let path = dir.join(format!("events-{ts}.json"));
+        match serde_json::to_string_pretty(&log) {
+            Ok(json) => {
+                if let Err(err) = std::fs::write(&path, json) {
+                    warn!("failed to write events file {}: {err:?}", path.display());
+                }
+            }
+            Err(err) => warn!("failed to serialize events: {err:?}"),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn record_touch(&mut self, touch: &Touch) {
+        let phase = match touch.phase {
+            TouchPhase::Started => "started",
+            TouchPhase::Moved => "moved",
+            TouchPhase::Ended => "ended",
+            TouchPhase::Stationary => "stationary",
+            TouchPhase::Cancelled => "cancelled",
+        };
+        debug!(phase, id = touch.id, x = touch.position.x, y = touch.position.y, t = self.music.position(), "recorded touch");
+        self.touches_log.push(TouchRecord {
+            t: self.music.position(),
+            phase,
+            id: touch.id,
+            x: touch.position.x,
+            y: touch.position.y,
+        });
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn reset_event_log(&mut self) {
+        self.touches_log.clear();
+        self.events_exported = false;
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     fn stop_recording(&mut self) {
+        self.export_events();
         self.recording = None;
     }
 }
@@ -992,6 +1123,8 @@ impl Scene for GameScene {
                         self.music.play()?;
                     }
                     self.state = State::Playing;
+                    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+                    self.reset_event_log();
                 }
                 time
             }
@@ -1188,6 +1321,10 @@ impl Scene for GameScene {
     }
 
     fn touch(&mut self, tm: &mut TimeManager, touch: &Touch) -> Result<bool> {
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+        if !tm.paused() && matches!(self.state, State::Playing) {
+            self.record_touch(touch);
+        }
         if self.mode == GameMode::TweakOffset {
             self.offset_analysis.touch(touch, tm.real_time() as f32);
         }
@@ -1345,6 +1482,8 @@ impl Scene for GameScene {
 
     fn next_scene(&mut self, tm: &mut TimeManager) -> NextScene {
         if self.should_exit {
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            self.export_events();
             if tm.paused() {
                 tm.resume();
             }
