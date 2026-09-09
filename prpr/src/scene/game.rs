@@ -41,6 +41,9 @@ use std::{
 };
 use tracing::{debug, warn};
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+use crate::recorder;
+
 const PAUSE_CLICK_INTERVAL: f32 = 0.7;
 
 #[rustfmt::skip]
@@ -142,6 +145,9 @@ pub struct GameScene {
     pause_first_time: f32,
 
     pub bad_notes: Vec<BadNote>,
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    recording: Option<recorder::Recording>,
 
     upload_fn: Option<UploadFn>,
     update_fn: Option<UpdateFn>,
@@ -335,6 +341,9 @@ impl GameScene {
             pause_first_time: f32::NEG_INFINITY,
 
             bad_notes: Vec::new(),
+
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            recording: None,
 
             upload_fn,
             update_fn,
@@ -626,6 +635,10 @@ impl GameScene {
                         miniquad::native::set_interceptor_state(false);
                     }
                     Some(0) => {
+                        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+                        {
+                            self.recording = None;
+                        }
                         reset!(self, res, tm);
                         if self.mode == GameMode::Exercise {
                             self.judge.advance_to(&mut self.chart, self.exercise_range.start);
@@ -828,6 +841,54 @@ impl GameScene {
             None
         }
     }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn recording_viewport(&self) -> (i32, i32, i32, i32) {
+        self.res.camera.viewport.unwrap_or((0, 0, screen_width() as i32, screen_height() as i32))
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn recording_dir(&self) -> PathBuf {
+        let info = &self.res.info;
+        let mut name = String::new();
+        if !info.name.is_empty() {
+            name.push_str(&info.name);
+        }
+        if !info.level.is_empty() {
+            name.push_str(" [");
+            name.push_str(&info.level);
+            name.push(']');
+        }
+        if let Some(id) = info.id {
+            name.push_str(&format!(" [{id}]"));
+        }
+        let name = name.trim();
+        let name = recorder::sanitize_name(if name.is_empty() { "chart" } else { name });
+        recorder::record_dir().join(name)
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn start_recording(&mut self) -> Result<()> {
+        if self.recording.is_some() {
+            return Ok(());
+        }
+        let vp = self.recording_viewport();
+        match recorder::Recording::start(self.recording_dir(), vp.2 as u32, vp.3 as u32) {
+            Ok(recording) => {
+                self.recording = Some(recording);
+                Ok(())
+            }
+            Err(err) => {
+                warn!("failed to start recording: {err:?}");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn stop_recording(&mut self) {
+        self.recording = None;
+    }
 }
 
 impl Scene for GameScene {
@@ -874,6 +935,8 @@ impl Scene for GameScene {
         }
         if self.mode == GameMode::Exercise && tm.now() > self.exercise_range.end && !tm.paused() {
             let state = self.state.clone();
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            self.stop_recording();
             reset!(self, self.res, tm);
             self.state = state;
             tm.seek_to(self.exercise_range.start);
@@ -935,6 +998,8 @@ impl Scene for GameScene {
             State::Playing => {
                 if time > self.res.track_length + WAIT_TIME {
                     self.state = State::Ending;
+                    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+                    self.stop_recording();
                     #[cfg(target_env = "ohos")]
                     miniquad::native::set_interceptor_state(false);
                 }
@@ -1017,6 +1082,10 @@ impl Scene for GameScene {
         };
         let time = (time - offset as f64).max(0.);
         self.res.time = time;
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+        if self.recording.is_none() && matches!(self.state, State::Playing) && !tm.paused() {
+            self.start_recording()?;
+        }
         if !tm.paused() && self.pause_rewind.is_none() && self.mode != GameMode::View {
             self.gl.quad_gl.viewport(self.res.camera.viewport);
             self.judge.update(&mut self.res, &mut self.chart, &mut self.bad_notes);
@@ -1250,6 +1319,25 @@ impl Scene for GameScene {
                     },
                 );
                 pop_camera_state();
+            }
+        }
+
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+        if self.res.camera.render_target.is_none() {
+            let vp = self.recording_viewport();
+            if let Some(recording) = &mut self.recording {
+                if !tm.paused() && matches!(self.state, State::Playing) {
+                    let real_time = tm.real_time();
+                    if recording.should_capture(real_time) {
+                        let audio_time = self.music.position();
+                        self.gl.flush();
+                        unsafe {
+                            recorder::read_framebuffer(vp, &mut recording.buffer);
+                        }
+                        recording.mark_captured(real_time);
+                        recording.capture_frame(audio_time);
+                    }
+                }
             }
         }
         Ok(())

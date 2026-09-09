@@ -8,6 +8,8 @@ pub mod info;
 pub mod judge;
 pub mod parse;
 pub mod particle;
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+pub mod recorder;
 pub mod scene;
 pub mod task;
 pub mod time;
