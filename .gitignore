@@ -40,3 +40,6 @@ inner.rs
 # OHOS
 
 /phira/dist/
+
+# CodeLens Graph local index
+.codelens/
