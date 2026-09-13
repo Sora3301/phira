@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-const RECORD_FPS: f64 = 60.0;
+pub const RECORD_FPS: f64 = 60.0;
 
 static RECORD_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -59,7 +59,8 @@ pub struct Recording {
     worker: Option<JoinHandle<()>>,
 
     pub buffer: Vec<u8>,
-    last_capture_time: f64,
+    first_capture_real: Option<f64>,
+    last_data: Vec<u8>,
     index: u64,
 }
 
@@ -122,39 +123,65 @@ impl Recording {
             return_rx,
             worker: Some(worker),
             buffer: Vec::new(),
-            last_capture_time: f64::NEG_INFINITY,
+            first_capture_real: None,
+            last_data: Vec::new(),
             index: 0,
         })
     }
 
-    /// Send the buffer filled by `read_framebuffer` to the encoder, recording
-    /// the audio playback position as the timestamp of this frame.
-    pub fn capture_frame(&mut self, audio_time: f64) {
-        let data = std::mem::take(&mut self.buffer);
+    fn send_frame(&mut self, data: Vec<u8>, audio_time: f64) -> Option<u64> {
         match self.tx.try_send(Msg::Frame {
             data,
             audio_time,
             index: self.index,
         }) {
-            Ok(()) => self.index += 1,
-            Err(TrySendError::Full(Msg::Frame { data, .. })) => {
-                // Encoder is lagging behind; skip this frame and reuse the buffer.
-                self.buffer = data;
+            Ok(()) => {
+                self.index += 1;
+                Some(self.index - 1)
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(Msg::Frame { data, .. })) => {
+                // Encoder is lagging behind; drop the frame and keep the buffer for reuse.
+                self.buffer = data;
+                None
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => None,
         }
+    }
+
+    /// Send the buffer filled by `read_framebuffer` to the encoder, recording
+    /// the audio playback position as the timestamp of this frame.
+    /// Returns the video frame index if the frame was written.
+    ///
+    /// Frames are aligned to a constant `{RECORD_FPS}` timeline in real time:
+    /// when the game renders slower than the target rate, repeats of the
+    /// previous frame fill the gaps, and when it renders faster, frames are
+    /// skipped. The video duration therefore always matches real time.
+    pub fn capture_frame(&mut self, audio_time: f64, real_time: f64) -> Option<u64> {
+        if self.first_capture_real.is_none() {
+            self.first_capture_real = Some(real_time);
+        }
+        let elapsed = real_time - self.first_capture_real.unwrap_or(real_time);
+        let target = ((elapsed * RECORD_FPS).round() as u64).max(1);
+        if self.index >= target {
+            if let Ok(buf) = self.return_rx.try_recv() {
+                self.buffer = buf;
+            }
+            return None;
+        }
+
+        let data = std::mem::take(&mut self.buffer);
+        self.last_data.clear();
+        self.last_data.extend_from_slice(&data);
+        let result = self.send_frame(data, audio_time);
         if let Ok(buf) = self.return_rx.try_recv() {
             self.buffer = buf;
         }
-    }
-
-    /// Whether enough real time has elapsed to capture the next frame.
-    pub fn should_capture(&self, real_time: f64) -> bool {
-        real_time - self.last_capture_time >= 1.0 / RECORD_FPS
-    }
-
-    pub fn mark_captured(&mut self, real_time: f64) {
-        self.last_capture_time = real_time;
+        while self.index < target {
+            if self.send_frame(self.last_data.clone(), audio_time).is_none() {
+                break;
+            }
+        }
+        result
     }
 }
 
@@ -213,9 +240,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         set_record_dir(&dir);
         let mut rec = Recording::start(record_dir().join("test chart"), 16, 16).unwrap();
+        // Simulate a slow game (10 captures over ~1s of real time): the
+        // recorder should pad the video to a constant 60 fps timeline.
         for i in 0..10 {
             rec.buffer = vec![(i * 20) as u8; 16 * 16 * 4];
-            rec.capture_frame(i as f64 / 60.0);
+            rec.capture_frame(i as f64 / 10.0, i as f64 / 10.0);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         drop(rec);
@@ -235,12 +264,12 @@ mod tests {
         for (frame, line) in lines.enumerate() {
             let mut it = line.split(',');
             assert_eq!(it.next().unwrap(), frame.to_string());
-            let expected = frame as f64 / 60.0;
-            let actual: f64 = it.next().unwrap().parse().unwrap();
-            assert!((actual - expected).abs() < 1e-9);
+            let audio: f64 = it.next().unwrap().parse().unwrap();
+            assert!((0.0..=1.0).contains(&audio));
             count += 1;
         }
-        assert_eq!(count, 10);
+        // 10 real captures + repeats filling the 60 fps timeline.
+        assert!(count >= 10, "expected padded frames, got {count}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

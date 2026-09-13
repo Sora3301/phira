@@ -15,7 +15,7 @@ use crate::{
     ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture, ScaleType},
     fs::FileSystem,
     info::{ChartFormat, ChartInfo},
-    judge::{Judge, Judgement},
+    judge::Judge,
     parse::{parse_extra, parse_pec, parse_phigros, parse_rpe},
     task::Task,
     time::TimeManager,
@@ -118,29 +118,21 @@ enum State {
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
 #[derive(Serialize)]
-struct TouchRecord {
-    t: f64,
-    phase: &'static str,
-    id: u64,
-    x: f32,
-    y: f32,
-}
-
-#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-#[derive(Serialize)]
 struct NoteRecord {
     t: f64,
+    frame: Option<i64>,
     line: u32,
     note: u32,
     kind: &'static str,
-    judgement: &'static str,
+    x: Option<f32>,
+    y: Option<f32>,
+    duration: Option<f64>,
 }
 
 #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
 #[derive(Serialize)]
 struct EventLog {
     offset: f32,
-    touches: Vec<TouchRecord>,
     notes: Vec<NoteRecord>,
 }
 
@@ -177,7 +169,7 @@ pub struct GameScene {
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     recording: Option<recorder::Recording>,
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-    touches_log: Vec<TouchRecord>,
+    video_frames: Vec<(f64, u64)>,
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     events_exported: bool,
 
@@ -377,7 +369,7 @@ impl GameScene {
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
             recording: None,
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-            touches_log: Vec::new(),
+            video_frames: Vec::new(),
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
             events_exported: false,
 
@@ -922,6 +914,30 @@ impl GameScene {
     }
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    fn note_position(&mut self, line_id: u32, note_id: u32) -> (f32, f32) {
+        let note_time = self
+            .chart
+            .lines
+            .get(line_id as usize)
+            .and_then(|line| line.notes.get(note_id as usize))
+            .map(|note| note.time);
+        let Some(note_time) = note_time else {
+            return (0.0, 0.0);
+        };
+        for line in self.chart.lines.iter_mut() {
+            line.object.set_time(note_time);
+            for note in line.notes.iter_mut() {
+                note.object.set_time(note_time);
+            }
+        }
+        let lines = &self.chart.lines;
+        let line = &lines[line_id as usize];
+        let local = line.notes[note_id as usize].object.now_translation(&self.res);
+        let world = line.now_transform(&self.res, lines).transform_point(&Point::new(local.x, local.y));
+        (world.x, -world.y)
+    }
+
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     fn export_events(&mut self) {
         if self.events_exported {
             return;
@@ -929,45 +945,49 @@ impl GameScene {
         self.events_exported = true;
 
         let offset = self.offset() as f64;
-        let notes = self.judge.judgements.borrow();
-        if self.touches_log.is_empty() && notes.is_empty() {
+        let notes = self.judge.judgements.borrow().clone();
+        if notes.is_empty() {
             return;
         }
-        let note_records: Vec<NoteRecord> = notes
-            .iter()
-            .filter_map(|(t, line_id, note_id, res)| {
-                let kind = self
-                    .chart
-                    .lines
-                    .get(*line_id as usize)
-                    .and_then(|line| line.notes.get(*note_id as usize))
-                    .map(|note| match &note.kind {
-                        NoteKind::Click => "click",
-                        NoteKind::Hold { .. } => "hold",
-                        NoteKind::Flick => "flick",
-                        NoteKind::Drag => "drag",
-                    })
-                    .unwrap_or("unknown");
-                let judgement = match *res {
-                    Ok(Judgement::Perfect) => "perfect",
-                    Ok(Judgement::Good) => "good",
-                    Ok(Judgement::Bad) => "bad",
-                    Ok(Judgement::Miss) => "miss",
-                    Err(true) => "hold_perfect",
-                    Err(false) => "hold_good",
-                };
-                Some(NoteRecord {
-                    t: t + offset,
-                    line: *line_id,
-                    note: *note_id,
-                    kind,
-                    judgement,
+        let mut note_records = Vec::with_capacity(notes.len());
+        for (t, line_id, note_id, _) in notes {
+            let kind = self
+                .chart
+                .lines
+                .get(line_id as usize)
+                .and_then(|line| line.notes.get(note_id as usize))
+                .map(|note| match &note.kind {
+                    NoteKind::Click => "click",
+                    NoteKind::Hold { .. } => "hold",
+                    NoteKind::Flick => "flick",
+                    NoteKind::Drag => "drag",
                 })
-            })
-            .collect();
+                .unwrap_or("unknown");
+            let (x, y) = self.note_position(line_id, note_id);
+            let duration = self
+                .chart
+                .lines
+                .get(line_id as usize)
+                .and_then(|line| line.notes.get(note_id as usize))
+                .and_then(|note| match &note.kind {
+                    NoteKind::Hold { end_time, .. } => Some(end_time - note.time),
+                    _ => None,
+                });
+            let t = t + offset;
+            let frame = self.video_frame_for(t);
+            note_records.push(NoteRecord {
+                t,
+                frame,
+                line: line_id,
+                note: note_id,
+                kind,
+                x: Some(x),
+                y: Some(y),
+                duration,
+            });
+        }
         let log = EventLog {
             offset: self.offset(),
-            touches: std::mem::take(&mut self.touches_log),
             notes: note_records,
         };
         let dir = self.recording_dir();
@@ -990,28 +1010,26 @@ impl GameScene {
         }
     }
 
+    /// Find the video frame whose recorded audio position is closest to `t`.
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-    fn record_touch(&mut self, touch: &Touch) {
-        let phase = match touch.phase {
-            TouchPhase::Started => "started",
-            TouchPhase::Moved => "moved",
-            TouchPhase::Ended => "ended",
-            TouchPhase::Stationary => "stationary",
-            TouchPhase::Cancelled => "cancelled",
-        };
-        debug!(phase, id = touch.id, x = touch.position.x, y = touch.position.y, t = self.music.position(), "recorded touch");
-        self.touches_log.push(TouchRecord {
-            t: self.music.position(),
-            phase,
-            id: touch.id,
-            x: touch.position.x,
-            y: touch.position.y,
+    fn video_frame_for(&self, t: f64) -> Option<i64> {
+        if self.video_frames.is_empty() {
+            return None;
+        }
+        let i = self.video_frames.partition_point(|(audio_time, _)| *audio_time < t);
+        let before = i.checked_sub(1);
+        let after = (i < self.video_frames.len()).then_some(i);
+        let best = [before, after].into_iter().flatten().min_by(|a, b| {
+            let da = (self.video_frames[*a].0 - t).abs();
+            let db = (self.video_frames[*b].0 - t).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         });
+        best.map(|idx| self.video_frames[idx].1 as i64)
     }
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     fn reset_event_log(&mut self) {
-        self.touches_log.clear();
+        self.video_frames.clear();
         self.events_exported = false;
     }
 
@@ -1321,10 +1339,6 @@ impl Scene for GameScene {
     }
 
     fn touch(&mut self, tm: &mut TimeManager, touch: &Touch) -> Result<bool> {
-        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-        if !tm.paused() && matches!(self.state, State::Playing) {
-            self.record_touch(touch);
-        }
         if self.mode == GameMode::TweakOffset {
             self.offset_analysis.touch(touch, tm.real_time() as f32);
         }
@@ -1460,22 +1474,25 @@ impl Scene for GameScene {
         }
 
         #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+        let mut captured_frame = None;
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
         if self.res.camera.render_target.is_none() {
             let vp = self.recording_viewport();
             if let Some(recording) = &mut self.recording {
                 if !tm.paused() && matches!(self.state, State::Playing) {
                     let real_time = tm.real_time();
-                    if recording.should_capture(real_time) {
-                        let audio_time = self.music.position();
-                        self.gl.flush();
-                        unsafe {
-                            recorder::read_framebuffer(vp, &mut recording.buffer);
-                        }
-                        recording.mark_captured(real_time);
-                        recording.capture_frame(audio_time);
+                    let audio_time = self.music.position();
+                    self.gl.flush();
+                    unsafe {
+                        recorder::read_framebuffer(vp, &mut recording.buffer);
                     }
+                    captured_frame = recording.capture_frame(audio_time, real_time).map(|frame| (audio_time, frame));
                 }
             }
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+        if let Some((audio_time, frame)) = captured_frame {
+            self.video_frames.push((audio_time, frame));
         }
         Ok(())
     }
