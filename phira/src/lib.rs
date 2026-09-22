@@ -207,9 +207,7 @@ async fn the_main() -> Result<()> {
     save_data()?;
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
-    if let Ok(cache) = dir::cache() {
-        prpr::recorder::set_record_dir(cache);
-    }
+    prpr::recorder::set_record_dir("../map-set");
 
     // Warm up the offline banned-word automaton so local edits can check
     // synchronously. No-op without the `aa` feature.

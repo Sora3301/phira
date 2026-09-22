@@ -52,6 +52,9 @@ mod inner;
 #[cfg(closed)]
 use inner::*;
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+mod trace;
+
 const WAIT_TIME: f64 = 0.5;
 const AFTER_TIME: f64 = 0.7;
 
@@ -168,6 +171,8 @@ pub struct GameScene {
 
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     recording: Option<recorder::Recording>,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+    trace: Option<trace::TraceRecorder>,
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
     video_frames: Vec<(f64, u64)>,
     #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
@@ -368,6 +373,8 @@ impl GameScene {
 
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
             recording: None,
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
+            trace: None,
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
             video_frames: Vec::new(),
             #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
@@ -666,6 +673,7 @@ impl GameScene {
                         #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
                         {
                             self.recording = None;
+                            self.trace = None;
                         }
                         reset!(self, res, tm);
                         if self.mode == GameMode::Exercise {
@@ -903,6 +911,13 @@ impl GameScene {
         let vp = self.recording_viewport();
         match recorder::Recording::start(self.recording_dir(), vp.2 as u32, vp.3 as u32) {
             Ok(recording) => {
+                // Share the video's timestamp so the finger trace is unambiguously
+                // paired with its recording (frame indices line up too).
+                let path = self.recording_dir().join(format!("fingers-{}.jsonl", recording.timestamp()));
+                match trace::TraceRecorder::start(&path, &self.chart) {
+                    Ok(trace) => self.trace = Some(trace),
+                    Err(err) => warn!("failed to start finger trace: {err:?}"),
+                }
                 self.recording = Some(recording);
                 Ok(())
             }
@@ -1037,6 +1052,7 @@ impl GameScene {
     fn stop_recording(&mut self) {
         self.export_events();
         self.recording = None;
+        self.trace = None;
     }
 }
 
@@ -1493,6 +1509,12 @@ impl Scene for GameScene {
         #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios", target_env = "ohos")))]
         if let Some((audio_time, frame)) = captured_frame {
             self.video_frames.push((audio_time, frame));
+            if let Some(trace) = &mut self.trace {
+                let chart_t = self.res.time;
+                if let Err(err) = trace.record_frame(audio_time, chart_t, frame as i64, &mut self.chart, &self.res) {
+                    warn!("failed to write finger trace: {err:?}");
+                }
+            }
         }
         Ok(())
     }

@@ -58,6 +58,7 @@ pub struct Recording {
     return_rx: Receiver<Vec<u8>>,
     worker: Option<JoinHandle<()>>,
 
+    timestamp: u128,
     pub buffer: Vec<u8>,
     first_capture_real: Option<f64>,
     last_data: Vec<u8>,
@@ -122,11 +123,18 @@ impl Recording {
             tx,
             return_rx,
             worker: Some(worker),
+            timestamp: ts,
             buffer: Vec::new(),
             first_capture_real: None,
             last_data: Vec::new(),
             index: 0,
         })
+    }
+
+    /// Timestamp (milliseconds) shared by this recording's files. Sidecar files
+    /// can use it to pair with the recorded video.
+    pub fn timestamp(&self) -> u128 {
+        self.timestamp
     }
 
     fn send_frame(&mut self, data: Vec<u8>, audio_time: f64) -> Option<u64> {
